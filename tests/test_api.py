@@ -248,3 +248,283 @@ def test_compare_missing_analysis_returns_404(client):
         "baseline_id": analysis["id"], "current_id": 999999,
     })
     assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# POST /api/analyses/{id}/gate
+# ---------------------------------------------------------------------------
+
+GATE_ERROR_OLD = {
+    "type": "object",
+    "properties": {"a": {"type": "string"}},
+}
+GATE_ERROR_NEW = {
+    "type": "object",
+    "properties": {"a": {"type": "string"}, "b": {"type": "integer"}},
+    "required": ["b"],
+}
+
+GATE_WARN_OLD = {
+    "type": "object",
+    "properties": {"a": {"type": "string", "pattern": "^x+$"}},
+}
+GATE_WARN_NEW = {
+    "type": "object",
+    "properties": {"a": {"type": "string", "pattern": "^xy$"}},
+}
+
+
+def _gate(client, analysis_id, **body):
+    return client.post(f"/api/analyses/{analysis_id}/gate", json=body)
+
+
+def test_gate_missing_analysis_returns_404(client):
+    resp = _gate(client, 999999, directions=["backward"])
+    assert resp.status_code == 404
+
+
+def test_gate_error_blocks_and_counts(client):
+    analysis = _create(client, GATE_ERROR_OLD, GATE_ERROR_NEW)
+    resp = _gate(client, analysis["id"], directions=["backward"])
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+
+    assert data["pass"] is False
+    assert data["checked_directions"] == ["backward"]
+    backward = data["directions"]["backward"]
+    assert backward["errors"] >= 1
+    assert backward["warning_limit"] == 0
+    assert backward["blocking"] == len(data["blocking"])
+    assert data["blocking"]
+    assert all(item["blocked_by"] == "error" for item in data["blocking"])
+    # 只检查 backward 时，forward 方向不参与
+    assert "forward" not in data["directions"]
+    assert all(item["direction"] == "backward" for item in data["blocking"])
+
+
+def test_gate_clean_direction_passes_regardless_of_unchecked(client):
+    analysis = _create(client, GATE_ERROR_OLD, GATE_ERROR_NEW)
+    # forward 方向无 error（新增可选属性不破坏向前兼容）
+    resp = _gate(client, analysis["id"], directions=["forward"])
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["pass"] is True
+    assert data["directions"]["forward"]["errors"] == 0
+    assert data["blocking"] == []
+
+
+def test_gate_exemption_excludes_issue_and_reports_rule_index(client):
+    analysis = _create(client, GATE_ERROR_OLD, GATE_ERROR_NEW)
+    target = next(
+        i for i in analysis["report"]["issues"]
+        if i["direction"] == "backward" and i["code"] == "required_added"
+    )
+    resp = _gate(client, analysis["id"],
+                 directions=["backward"],
+                 exemptions=[{
+                     "direction": "backward",
+                     "code": "required_added",
+                     "path": target["path"],
+                 }])
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+
+    stats = data["directions"]["backward"]
+    assert stats["exempted"] == 1
+    assert stats["errors"] == 0
+    assert len(data["exempted"]) == 1
+    assert data["exempted"][0]["rule_index"] == 1
+    assert data["exempted"][0]["path"] == target["path"]
+    assert data["pass"] is True
+    assert data["blocking"] == []
+
+
+def test_gate_path_wildcard_single_segment(client):
+    analysis = _create(client,
+                       {"type": "object",
+                        "properties": {"a": {"type": "string"},
+                                       "b": {"type": "string"}}},
+                       {"type": "object",
+                        "properties": {"a": {"type": "integer"},
+                                       "b": {"type": "integer"}}})
+    # 报告含 #/properties/a、#/properties/b 两处 type_removed，用单段 * 一并豁免
+    resp = _gate(client, analysis["id"],
+                 directions=["backward"],
+                 exemptions=[{"direction": "backward", "code": "type_removed",
+                              "path": "#/properties/*"}])
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["pass"] is True
+    assert len(data["exempted"]) == 2
+    assert {item["path"] for item in data["exempted"]} == {
+        "#/properties/a", "#/properties/b"
+    }
+
+
+def test_gate_wildcard_does_not_cross_segments(client):
+    analysis = _create(client,
+                       {"type": "object",
+                        "properties": {"a": {"type": "string"},
+                                       "b": {"type": "string"}}},
+                       {"type": "object",
+                        "properties": {"a": {"type": "integer"},
+                                       "b": {"type": "integer"}}})
+    # #/* 只有一段，命不中 #/properties/a
+    resp = _gate(client, analysis["id"],
+                 directions=["backward"],
+                 exemptions=[{"direction": "backward", "code": "type_removed",
+                              "path": "#/*"}])
+    data = resp.json()
+    assert data["pass"] is False
+    assert len(data["blocking"]) == 2
+    assert data["exempted"] == []
+
+
+def test_gate_unique_rule_prefers_exact_then_literal_then_order(client):
+    analysis = _create(client,
+                       {"type": "object",
+                        "properties": {"a": {"type": "string"}}},
+                       {"type": "object",
+                        "properties": {"a": {"type": "integer"}}})
+    # 三条规则都命中该 issue：最精确的规则 3（direction+code+字面 path）必须唯一获胜
+    resp = _gate(client, analysis["id"],
+                 directions=["backward"],
+                 exemptions=[
+                     {"direction": "*", "code": "*", "path": "#/properties/*"},
+                     {"direction": "backward", "code": "type_removed",
+                      "path": "#/properties/*"},
+                     {"direction": "backward", "code": "type_removed",
+                      "path": "#/properties/a"},
+                 ])
+    data = resp.json()
+    assert data["pass"] is True
+    assert len(data["exempted"]) == 1
+    assert data["exempted"][0]["rule_index"] == 3
+
+    # 前两者同精确字段数与字面段数，声明顺序靠后者（规则 2）获胜
+    resp = _gate(client, analysis["id"],
+                 directions=["backward"],
+                 exemptions=[
+                     {"direction": "backward", "code": "type_removed",
+                      "path": "#/properties/*"},
+                     {"direction": "backward", "code": "type_removed",
+                      "path": "#/properties/*"},
+                 ])
+    data = resp.json()
+    assert data["exempted"][0]["rule_index"] == 2
+
+
+def test_gate_warning_limit(client):
+    analysis = _create(client, GATE_WARN_OLD, GATE_WARN_NEW)
+    # backward 恰有 1 条 warning：上限 1 通过
+    resp = _gate(client, analysis["id"],
+                 directions=["backward"],
+                 warning_limits={"backward": 1})
+    data = resp.json()
+    assert resp.status_code == 200
+    assert data["pass"] is True
+    assert data["directions"]["backward"]["warnings"] == 1
+    assert data["directions"]["backward"]["warning_limit_exceeded"] is False
+
+    # 上限 0：warning 超限阻断
+    resp = _gate(client, analysis["id"],
+                 directions=["backward"],
+                 warning_limits={"backward": 0})
+    data = resp.json()
+    assert data["pass"] is False
+    assert data["directions"]["backward"]["warning_limit_exceeded"] is True
+    assert len(data["blocking"]) == 1
+    assert data["blocking"][0]["blocked_by"] == "warning_limit"
+    assert data["blocking"][0]["code"] == "pattern_changed"
+
+
+def test_gate_exempted_warning_not_counted_toward_limit(client):
+    analysis = _create(client, GATE_WARN_OLD, GATE_WARN_NEW)
+    resp = _gate(client, analysis["id"],
+                 directions=["backward"],
+                 warning_limits={"backward": 0},
+                 exemptions=[{"direction": "backward", "code": "pattern_changed",
+                              "path": "#/properties/a"}])
+    data = resp.json()
+    assert data["pass"] is True
+    stats = data["directions"]["backward"]
+    assert stats["warnings"] == 0
+    assert stats["exempted"] == 1
+
+
+def test_gate_both_directions_separate_limits(client):
+    analysis = _create(client, GATE_WARN_OLD, GATE_WARN_NEW)
+    # 两个方向各 1 条 warning；backward 限额 1 放行，forward 限额 0 阻断
+    resp = _gate(client, analysis["id"],
+                 directions=["backward", "forward"],
+                 warning_limits={"backward": 1, "forward": 0})
+    data = resp.json()
+    assert data["pass"] is False
+    assert data["directions"]["backward"]["warning_limit_exceeded"] is False
+    assert data["directions"]["forward"]["warning_limit_exceeded"] is True
+    assert [item["direction"] for item in data["blocking"]] == ["forward"]
+
+
+def test_gate_directions_deduped(client):
+    analysis = _create(client, GATE_WARN_OLD, GATE_WARN_NEW)
+    resp = _gate(client, analysis["id"],
+                 directions=["forward", "forward"],
+                 warning_limits={"forward": 1})
+    data = resp.json()
+    assert resp.status_code == 200
+    assert data["checked_directions"] == ["forward"]
+
+
+def test_gate_does_not_modify_report(client):
+    analysis = _create(client, GATE_ERROR_OLD, GATE_ERROR_NEW)
+    resp = _gate(client, analysis["id"],
+                 directions=["backward"],
+                 exemptions=[{"direction": "*", "code": "*", "path": "#/properties/*"}])
+    assert resp.status_code == 200
+    after = client.get(f"/api/analyses/{analysis['id']}").json()
+    assert after["report"] == analysis["report"]
+    assert after["old_schema"] == analysis["old_schema"]
+    assert after["new_schema"] == analysis["new_schema"]
+
+
+def test_gate_validation_errors(client):
+    analysis = _create(client, GATE_ERROR_OLD, GATE_ERROR_NEW)
+
+    # directions 不能为空
+    resp = _gate(client, analysis["id"], directions=[])
+    assert resp.status_code == 422
+
+    # 非法方向
+    resp = _gate(client, analysis["id"], directions=["sideways"])
+    assert resp.status_code == 422
+
+    # warning 上限不能为负
+    resp = _gate(client, analysis["id"],
+                 directions=["backward"], warning_limits={"backward": -1})
+    assert resp.status_code == 422
+
+    # path 必须是 # 开头的 JSON Pointer
+    resp = _gate(client, analysis["id"],
+                 directions=["backward"],
+                 exemptions=[{"direction": "backward", "code": "x",
+                              "path": "/properties/a"}])
+    assert resp.status_code == 422
+
+    # path 不允许空段
+    resp = _gate(client, analysis["id"],
+                 directions=["backward"],
+                 exemptions=[{"direction": "backward", "code": "x",
+                              "path": "#/properties//a"}])
+    assert resp.status_code == 422
+
+
+def test_gate_response_uses_pass_key(client):
+    analysis = _create(client,
+                       {"type": "object", "properties": {"a": {"type": "string"}}},
+                       {"type": "object",
+                        "properties": {"a": {"type": "string"},
+                                       "b": {"type": "integer"}}})
+    resp = _gate(client, analysis["id"], directions=["backward", "forward"])
+    assert resp.status_code == 200
+    assert "pass" in resp.json()
+    assert resp.json()["pass"] is True

@@ -16,15 +16,17 @@
 ```
 .
 ├── app/
-│   ├── main.py          # FastAPI 路由：创建分析、查询报告、基线对比
+│   ├── main.py          # FastAPI 路由：创建分析、查询报告、基线对比、发布门禁
 │   ├── compat.py        # 兼容性分析引擎（递归比较 + 最小反例生成）
 │   ├── compare.py       # 报告基线对比（issue 指纹 + 新增/修复/仍存/级别变化分类）
+│   ├── gate.py          # 发布门禁（方向/警告上限判定 + issue 豁免规则匹配）
 │   ├── database.py      # SQLite / SQLAlchemy 初始化
 │   ├── models.py        # Analysis ORM 模型
 │   └── schemas.py       # Pydantic 请求 / 响应模型
 ├── tests/
 │   ├── test_compat.py   # 引擎单元测试（30+ 用例）
 │   ├── test_compare.py  # 基线对比单元测试
+│   ├── test_gate.py     # 发布门禁单元测试
 │   └── test_api.py      # 接口端到端测试
 ├── Dockerfile
 ├── docker-compose.yml
@@ -328,6 +330,131 @@ curl -X POST http://localhost:8000/api/analyses/compare \
 
 `compatibility` 给出两个兼容方向（backward / forward）在两次分析间的变化，
 `summary_diff` 给出错误 / 警告 / 总数（含分方向）的基线值、当前值与差值。
+
+### `POST /api/analyses/{id}/gate` — 发布门禁
+
+在一份已落库的分析报告之上做发布放行判定。接口为**纯只读**操作，不会修改
+原始报告；分析编号不存在时返回 `404`。
+
+请求体：
+
+| 字段 | 类型 | 必填 | 说明 |
+| ---- | ---- | ---- | ---- |
+| `directions` | string[] | 是 | 本次检查的兼容方向，取值 `backward` / `forward`，自动去重、按声明顺序；未检查方向不影响结论 |
+| `warning_limits` | object | 否 | 各方向允许的**未豁免** warning 数量上限，缺省为 `0`；键为方向名，值为非负整数 |
+| `exemptions` | object[] | 否 | issue 豁免规则列表，规则序号从 **1** 开始 |
+
+每条豁免规则包含三个字段：
+
+| 字段 | 说明 |
+| ---- | ---- |
+| `direction` | `backward` / `forward` / `*`（任意方向） |
+| `code` | issue 代码，`*` 表示任意代码 |
+| `path` | JSON Pointer（`#` 或 `#/a/b`），支持**单段** `*` 通配（如 `#/properties/*/items`），路径段按 RFC 6901 解码（`~1` → `/`、`~0` → `~`）；`*` 只匹配单个路径段，不跨 `/` |
+
+同一条 issue 命中多条规则时，依次按以下依据确定**唯一**规则：
+
+1. **精确字段数**更多：`direction`、`code` 非 `*` 各计 1，`path` 不含通配段
+   再计 1（上限 3）；
+2. **path 字面段数**更多（除 `*` 外的路径段数量）；
+3. 前两项仍相同，**声明顺序靠后**者获胜。
+
+被豁免的 issue 完全不参与计数；任一未豁免 `error` 直接阻断；某方向未豁免
+`warning` 数超过该方向上限时，按报告顺序**超出上限的部分**作为阻断项。
+
+```bash
+curl -X POST http://localhost:8000/api/analyses/1/gate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "directions": ["backward"],
+    "warning_limits": { "backward": 2 },
+    "exemptions": [
+      { "direction": "backward", "code": "type_removed",
+        "path": "#/properties/legacy_id" },
+      { "direction": "*", "code": "*",
+        "path": "#/properties/tags/*/items" }
+    ]
+  }'
+```
+
+响应：
+
+```json
+{
+  "pass": false,
+  "checked_directions": ["backward"],
+  "directions": {
+    "backward": {
+      "errors": 1,
+      "warnings": 3,
+      "exempted": 2,
+      "total": 6,
+      "warning_limit": 2,
+      "warning_limit_exceeded": true,
+      "blocking": 2
+    }
+  },
+  "blocking": [
+    {
+      "direction": "backward",
+      "path": "#/properties/role",
+      "code": "enum_value_removed",
+      "severity": "error",
+      "message": "枚举值 \"viewer\" 在新版中已被移除",
+      "reason": "旧版枚举包含 \"viewer\"，新版枚举不再包含该值，使用该值的旧数据会校验失败",
+      "blocked_by": "error"
+    },
+    {
+      "direction": "backward",
+      "path": "#/properties/name",
+      "code": "pattern_changed",
+      "severity": "warning",
+      "message": "新版正则约束为 '^[a-z]+$'",
+      "reason": "旧版 pattern 为 '.*'，新版正则可能拒绝部分旧字符串",
+      "blocked_by": "warning_limit"
+    }
+  ],
+  "exempted": [
+    {
+      "direction": "backward",
+      "path": "#/properties/legacy_id",
+      "code": "type_removed",
+      "severity": "error",
+      "message": "新版不再接受类型 integer",
+      "reason": "……",
+      "rule_index": 1
+    },
+    {
+      "direction": "backward",
+      "path": "#/properties/tags/0/items",
+      "code": "min_items_increased",
+      "severity": "error",
+      "message": "新版要求数组至少 2 个元素（旧版 0）",
+      "reason": "……",
+      "rule_index": 2
+    }
+  ]
+}
+```
+
+字段说明：
+
+- `pass`：所有检查方向均无未豁免 error 且未豁免 warning 未超上限时为 `true`；
+- `directions`：仅包含本次检查的方向。每个方向给出 `errors` / `warnings` /
+  `exempted` / `total`（均为该方向全部 issue 的计数，`errors`、`warnings`
+  不含豁免项）、`warning_limit`、是否超限（`warning_limit_exceeded`）与
+  `blocking` 阻断项数；
+- `blocking`：阻断项（轻量 issue 字段 + `blocked_by`，取值 `error` 或
+  `warning_limit`），按报告顺序排列；
+- `exempted`：命中豁免规则的 issue，`rule_index` 为命中的唯一规则序号（从 1
+  开始）。
+
+请求体非法（`directions` 为空或取值未知、warning 上限为负、豁免规则 `path`
+不是合法 JSON Pointer 等）返回 `422`；分析不存在返回 `404`：
+
+```json
+{ "detail": "分析记录不存在: 999999" }
+```
 
 ### `GET /health`
 

@@ -1,7 +1,9 @@
 """Pydantic 请求 / 响应模型。"""
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+from app.gate import is_valid_pointer
 
 
 class AnalysisCreate(BaseModel):
@@ -155,3 +157,106 @@ class CompareResponse(BaseModel):
     summary_diff: SummaryDiff
     issues: IssueGroups
     counts: IssueGroupCounts
+
+
+# ---------------------------------------------------------------------------
+# POST /api/analyses/{id}/gate 发布门禁
+# ---------------------------------------------------------------------------
+
+class GateExemption(BaseModel):
+    """一条 issue 豁免规则；三字段均可写 ``*`` 通配（path 支持单段 *）。"""
+
+    direction: Literal["backward", "forward", "*"] = Field(
+        ..., description="兼容方向，* 表示任意方向"
+    )
+    code: str = Field(..., min_length=1, description="issue 代码，* 表示任意代码")
+    path: str = Field(
+        ...,
+        description="JSON Pointer 形式的 issue path（# 或 #/a/b），单段 * 通配",
+    )
+
+    @field_validator("code")
+    @classmethod
+    def _validate_code(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("code 不能为空")
+        return value
+
+    @field_validator("path")
+    @classmethod
+    def _validate_path(cls, value: str) -> str:
+        if not is_valid_pointer(value):
+            raise ValueError(
+                "path 必须是 '#' 或 '#/段/段…' 形式的 JSON Pointer，段不能为空"
+            )
+        return value
+
+
+class GateRequest(BaseModel):
+    """POST /api/analyses/{id}/gate 请求体。"""
+
+    directions: list[Literal["backward", "forward"]] = Field(
+        ..., min_length=1, description="需要检查的兼容方向（去重后按声明顺序）"
+    )
+    warning_limits: dict[Literal["backward", "forward"], int] = Field(
+        default_factory=dict, description="各方向允许的未豁免 warning 上限（默认 0）"
+    )
+    exemptions: list[GateExemption] = Field(
+        default_factory=list, description="issue 豁免规则，序号从 1 开始"
+    )
+
+    @field_validator("directions")
+    @classmethod
+    def _dedupe_directions(cls, value: list[str]) -> list[str]:
+        deduped: list[str] = []
+        for direction in value:
+            if direction not in deduped:
+                deduped.append(direction)
+        return deduped
+
+    @field_validator("warning_limits")
+    @classmethod
+    def _non_negative_limits(cls, value: dict[str, int]) -> dict[str, int]:
+        for direction, limit in value.items():
+            if limit < 0:
+                raise ValueError(f"{direction} 的 warning 上限不能为负数")
+        return value
+
+
+class GateIssue(BaseModel):
+    """门禁结果中的轻量 issue（不含反例等大字段）。"""
+
+    direction: Literal["backward", "forward"]
+    path: str
+    code: str
+    severity: Literal["error", "warning"]
+    message: str
+    reason: str
+
+
+class GateBlockingIssue(GateIssue):
+    blocked_by: Literal["error", "warning_limit"]
+
+
+class GateExemptedIssue(GateIssue):
+    rule_index: int = Field(..., ge=1, description="命中的豁免规则序号（从 1 开始）")
+
+
+class GateDirectionResult(BaseModel):
+    errors: int
+    warnings: int
+    exempted: int
+    total: int
+    warning_limit: int
+    warning_limit_exceeded: bool
+    blocking: int
+
+
+class GateResponse(BaseModel):
+    pass_field: bool = Field(..., alias="pass", description="门禁是否通过")
+    checked_directions: list[Literal["backward", "forward"]]
+    directions: dict[str, GateDirectionResult]
+    blocking: list[GateBlockingIssue]
+    exempted: list[GateExemptedIssue]
+
+    model_config = {"populate_by_name": True}

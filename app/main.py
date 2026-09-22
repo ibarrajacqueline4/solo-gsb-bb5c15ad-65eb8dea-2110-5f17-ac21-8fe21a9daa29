@@ -7,7 +7,7 @@ from jsonschema.exceptions import SchemaError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app import compat, compare
+from app import compat, compare, gate
 from app.database import get_db, init_db
 from app.models import Analysis
 from app.schemas import (
@@ -16,6 +16,8 @@ from app.schemas import (
     AnalysisResponse,
     CompareRequest,
     CompareResponse,
+    GateRequest,
+    GateResponse,
 )
 
 
@@ -128,6 +130,28 @@ def compare_analyses(payload: CompareRequest, db: Session = Depends(get_db)):
         )
     result = compare.compare_reports(baseline.report, current.report)
     return {"baseline_id": baseline.id, "current_id": current.id, **result}
+
+
+@app.post(
+    "/api/analyses/{analysis_id}/gate",
+    response_model=GateResponse,
+    tags=["analyses"],
+    summary="发布门禁：按声明方向与豁免规则判定是否放行",
+)
+def evaluate_analysis_gate(analysis_id: int, payload: GateRequest, db: Session = Depends(get_db)):
+    # 只读原报告做门禁判定，绝不修改原始分析记录
+    row = db.get(Analysis, analysis_id)
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"分析记录不存在: {analysis_id}",
+        )
+    return gate.evaluate_gate(
+        row.report,
+        directions=payload.directions,
+        warning_limits=dict(payload.warning_limits),
+        exemptions=[rule.model_dump() for rule in payload.exemptions],
+    )
 
 
 @app.get(
