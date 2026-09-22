@@ -7,7 +7,7 @@ from jsonschema.exceptions import SchemaError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app import compat, compare
+from app import compat, compare, gate
 from app.database import get_db, init_db
 from app.models import Analysis
 from app.schemas import (
@@ -16,6 +16,8 @@ from app.schemas import (
     AnalysisResponse,
     CompareRequest,
     CompareResponse,
+    GateRequest,
+    GateResponse,
 )
 
 
@@ -128,6 +130,33 @@ def compare_analyses(payload: CompareRequest, db: Session = Depends(get_db)):
         )
     result = compare.compare_reports(baseline.report, current.report)
     return {"baseline_id": baseline.id, "current_id": current.id, **result}
+
+
+@app.post(
+    "/api/analyses/{analysis_id}/gate",
+    response_model=GateResponse,
+    tags=["analyses"],
+    summary="发布门禁：按方向阈值与豁免规则评估报告",
+)
+def evaluation_gate(analysis_id: int, payload: GateRequest, db: Session = Depends(get_db)):
+    # 只读评估，绝不修改原始分析报告
+    row = db.get(Analysis, analysis_id)
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="分析记录不存在")
+    result = gate.evaluate_gate(
+        row.report,
+        {
+            "directions": payload.directions,
+            "max_warnings": (
+                {k: v for k, v in payload.max_warnings.items()}
+                if payload.max_warnings is not None
+                else {}
+            ),
+            "exemptions": [rule.model_dump() for rule in payload.exemptions],
+        },
+    )
+    return {"passed": result["pass"], "counts": result["counts"],
+            "blocking": result["blocking"], "exempted": result["exempted"]}
 
 
 @app.get(

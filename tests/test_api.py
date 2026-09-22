@@ -248,3 +248,222 @@ def test_compare_missing_analysis_returns_404(client):
         "baseline_id": analysis["id"], "current_id": 999999,
     })
     assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# POST /api/analyses/{id}/gate
+# ---------------------------------------------------------------------------
+
+# backward：required_added error（#）+ 两条 pattern_changed warning
+# forward：两条 pattern_changed warning
+GATE_OLD = {
+    "type": "object",
+    "properties": {
+        "a": {"type": "string", "pattern": "^x"},
+        "b": {"type": "string", "pattern": "^y"},
+    },
+}
+GATE_NEW = {
+    "type": "object",
+    "properties": {
+        "a": {"type": "string", "pattern": "^xx"},
+        "b": {"type": "string", "pattern": "^yy"},
+    },
+    "required": ["b"],
+}
+
+
+def _gate_report(client):
+    return _create(client, GATE_OLD, GATE_NEW, "gate-case")
+
+
+def test_gate_error_blocks_and_counts(client):
+    analysis = _gate_report(client)
+    resp = client.post(f"/api/analyses/{analysis['id']}/gate", json={
+        "directions": ["backward"],
+    })
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["pass"] is False
+    counts = data["counts"]["backward"]
+    assert counts["errors"] == 1
+    assert counts["warnings"] == 2
+    assert counts["exempted"] == 0
+    assert counts["total"] == 3
+    assert counts["max_warnings"] == 0
+    codes = [(i["code"], i["blocked_reason"]) for i in data["blocking"]]
+    assert ("required_added", "error") in codes
+    assert sum(1 for _, reason in codes if reason == "warning_limit_exceeded") == 2
+    assert data["exempted"] == []
+
+
+def test_gate_warning_cap_pass_and_overflow(client):
+    analysis = _gate_report(client)
+    # cap=1：required error 豁免后只剩 2 条 warning，超 1 条
+    resp = client.post(f"/api/analyses/{analysis['id']}/gate", json={
+        "directions": ["backward"],
+        "max_warnings": {"backward": 1},
+        "exemptions": [
+            {"direction": "backward", "code": "required_added", "path": "#"},
+        ],
+    })
+    data = resp.json()
+    assert data["pass"] is False
+    assert [b["path"] for b in data["blocking"]] == ["#/properties/b"]
+    assert data["blocking"][0]["blocked_reason"] == "warning_limit_exceeded"
+    assert data["counts"]["backward"]["warnings"] == 2
+    assert data["counts"]["backward"]["errors"] == 0
+    assert data["exempted"][0]["rule_index"] == 0
+
+    # cap=2：全部 warning 在额度内 -> 通过
+    resp = client.post(f"/api/analyses/{analysis['id']}/gate", json={
+        "directions": ["backward"],
+        "max_warnings": {"backward": 2},
+        "exemptions": [
+            {"direction": "backward", "code": "required_added", "path": "#"},
+        ],
+    })
+    assert resp.json()["pass"] is True
+    assert resp.json()["blocking"] == []
+
+
+def test_gate_wildcard_exemption_and_rule_index(client):
+    analysis = _gate_report(client)
+    resp = client.post(f"/api/analyses/{analysis['id']}/gate", json={
+        "directions": ["backward"],
+        "exemptions": [
+            # 下标 0：通配规则命中两条 pattern_changed
+            {"direction": "backward", "code": "pattern_changed",
+             "path": "#/properties/*"},
+            # 下标 1：精确规则命中 required_added
+            {"direction": "backward", "code": "required_added", "path": "#"},
+        ],
+    })
+    data = resp.json()
+    assert data["pass"] is True
+    rule_indices = sorted((e["path"], e["rule_index"]) for e in data["exempted"])
+    assert rule_indices == [
+        ("#", 1),
+        ("#/properties/a", 0),
+        ("#/properties/b", 0),
+    ]
+    # 豁免项不计数
+    assert data["counts"]["backward"] == {
+        "errors": 0, "warnings": 0, "exempted": 3, "total": 3,
+        "max_warnings": 0,
+    }
+
+
+def test_gate_exact_rule_beats_later_wildcard(client):
+    analysis = _gate_report(client)
+    # 两条规则都命中 #/properties/a 的 pattern_changed：
+    # 下标 0 精确 path（3 精确字段），下标 1 通配 path（2 精确字段）；
+    # 即使通配规则声明更晚，也必须记到精确规则。
+    resp = client.post(f"/api/analyses/{analysis['id']}/gate", json={
+        "directions": ["backward"],
+        "exemptions": [
+            {"direction": "backward", "code": "pattern_changed",
+             "path": "#/properties/a"},
+            {"direction": "backward", "code": "pattern_changed",
+             "path": "#/properties/*"},
+        ],
+    })
+    data = resp.json()
+    hit_a = [e for e in data["exempted"] if e["path"] == "#/properties/a"]
+    hit_b = [e for e in data["exempted"] if e["path"] == "#/properties/b"]
+    assert len(hit_a) == 1 and hit_a[0]["rule_index"] == 0
+    assert len(hit_b) == 1 and hit_b[0]["rule_index"] == 1
+    # required_added 未被豁免 -> 门禁仍失败
+    assert data["pass"] is False
+
+
+def test_gate_unchecked_direction_ignored(client):
+    analysis = _gate_report(client)
+    # 只检查 forward：backward 的 error 完全不影响结论；forward 2 条 warning，cap=2
+    resp = client.post(f"/api/analyses/{analysis['id']}/gate", json={
+        "directions": ["forward"],
+        "max_warnings": {"forward": 2, "backward": 0},
+    })
+    data = resp.json()
+    assert data["pass"] is True
+    assert set(data["counts"]) == {"forward"}
+    assert data["counts"]["forward"]["warnings"] == 2
+
+
+def test_gate_clean_direction_passes(client):
+    # 新增可选字段：两个方向都没有 issue
+    analysis = _create(
+        client,
+        {"type": "object", "properties": {"a": {"type": "string"}}},
+        {"type": "object", "properties": {"a": {"type": "string"},
+                                           "b": {"type": "integer"}}},
+    )
+    resp = client.post(f"/api/analyses/{analysis['id']}/gate", json={
+        "directions": ["backward", "forward"],
+    })
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["pass"] is True
+    assert data["blocking"] == []
+    assert data["exempted"] == []
+    assert data["counts"]["backward"]["total"] == 0
+    assert data["counts"]["forward"]["total"] == 0
+
+
+def test_gate_missing_analysis_returns_404(client):
+    resp = client.post("/api/analyses/999999/gate", json={
+        "directions": ["backward"],
+    })
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "分析记录不存在"
+
+
+def test_gate_validation_errors(client):
+    analysis = _gate_report(client)
+    base = f"/api/analyses/{analysis['id']}/gate"
+
+    # directions 不能为空
+    resp = client.post(base, json={"directions": []})
+    assert resp.status_code == 422
+
+    # 非法方向
+    resp = client.post(base, json={"directions": ["sideways"]})
+    assert resp.status_code == 422
+
+    # 非法 path（不以 #/ 开头）
+    resp = client.post(base, json={
+        "directions": ["backward"],
+        "exemptions": [{"direction": "backward", "code": "x", "path": "properties/a"}],
+    })
+    assert resp.status_code == 422
+
+    # 负的 warning 上限
+    resp = client.post(base, json={
+        "directions": ["backward"], "max_warnings": {"backward": -1},
+    })
+    assert resp.status_code == 422
+
+    # code 不能为空
+    resp = client.post(base, json={
+        "directions": ["backward"],
+        "exemptions": [{"direction": "backward", "code": "", "path": "#"}],
+    })
+    assert resp.status_code == 422
+
+
+def test_gate_does_not_modify_report(client):
+    analysis = _gate_report(client)
+    resp = client.post(f"/api/analyses/{analysis['id']}/gate", json={
+        "directions": ["backward"],
+        "exemptions": [
+            {"direction": "backward", "code": "required_added", "path": "#"},
+            {"direction": "backward", "code": "pattern_changed",
+             "path": "#/properties/*"},
+        ],
+    })
+    assert resp.status_code == 200
+
+    after = client.get(f"/api/analyses/{analysis['id']}").json()
+    assert after["report"] == analysis["report"]
+    assert after["old_schema"] == analysis["old_schema"]
+    assert after["new_schema"] == analysis["new_schema"]

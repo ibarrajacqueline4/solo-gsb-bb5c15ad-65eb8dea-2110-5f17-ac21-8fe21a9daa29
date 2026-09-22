@@ -16,15 +16,17 @@
 ```
 .
 ├── app/
-│   ├── main.py          # FastAPI 路由：创建分析、查询报告、基线对比
+│   ├── main.py          # FastAPI 路由：创建分析、查询报告、基线对比、发布门禁
 │   ├── compat.py        # 兼容性分析引擎（递归比较 + 最小反例生成）
 │   ├── compare.py       # 报告基线对比（issue 指纹 + 新增/修复/仍存/级别变化分类）
+│   ├── gate.py          # 发布门禁（方向阈值、warning 上限、issue 豁免规则）
 │   ├── database.py      # SQLite / SQLAlchemy 初始化
 │   ├── models.py        # Analysis ORM 模型
 │   └── schemas.py       # Pydantic 请求 / 响应模型
 ├── tests/
 │   ├── test_compat.py   # 引擎单元测试（30+ 用例）
 │   ├── test_compare.py  # 基线对比单元测试
+│   ├── test_gate.py     # 发布门禁单元测试
 │   └── test_api.py      # 接口端到端测试
 ├── Dockerfile
 ├── docker-compose.yml
@@ -328,6 +330,119 @@ curl -X POST http://localhost:8000/api/analyses/compare \
 
 `compatibility` 给出两个兼容方向（backward / forward）在两次分析间的变化，
 `summary_diff` 给出错误 / 警告 / 总数（含分方向）的基线值、当前值与差值。
+
+### `POST /api/analyses/{id}/gate` — 发布门禁
+
+对一份已落库的分析报告执行发布门禁评估。接口为**纯只读**操作，不会修改
+原始报告；分析编号不存在返回 `404`。
+
+请求体：
+
+| 字段           | 类型     | 必填 | 说明                                            |
+| -------------- | -------- | ---- | ----------------------------------------------- |
+| `directions`   | string[] | 是   | 需要检查的兼容方向（至少一个，重复值自动去重）  |
+| `max_warnings` | object   | 否   | 各方向允许的未豁免 warning 上限，缺省视为 `0`   |
+| `exemptions`   | object[] | 否   | issue 豁免规则，按声明顺序确定优先级            |
+
+`exemptions` 规则的三个字段均必填：
+
+| 字段        | 说明                                                                 |
+| ----------- | -------------------------------------------------------------------- |
+| `direction` | 兼容方向 `backward` / `forward`，必须**字面相等**                    |
+| `code`      | issue 代码，必须**字面相等**                                         |
+| `path`      | JSON Pointer 风格路径（`#`、`#/properties/a`），支持**单段** `*` 通配 |
+
+`path` 通配规则：
+
+- `*` 必须独占一整段：`#/properties/*` 可匹配 `#/properties/a`，
+  但不匹配 `#/properties/a/items`；`#/properties/a*` 中的 `*` 是普通字符；
+- 路径与报告 issue 的 `path` 字段同样遵守 JSON Pointer 转义（`~1`、`~0`）；
+- 段数必须一致，`#/*` 不匹配根路径 `#`。
+
+**规则去重（同一 issue 命中多条规则时）**，依次按以下条件选出唯一规则：
+
+1. **精确字段数多者优先**：path 不含 `*` 时 direction / code / path 三字段
+   全部精确（3）；path 含通配段时仅前两者精确（2）；
+2. **path 字面段数多者优先**：通配段不计入字面段，`#` 为 0 段
+   （如 `#/properties/*/items` 字面段数为 2，`#/*/*/items` 为 1）；
+3. **声明顺序靠后者优先**：以上都相同时，以 `exemptions` 数组中**下标更大**
+   （声明更晚）的规则为准。
+
+**判定规则**：
+
+- 被豁免的 issue **不计数**，也不会成为阻断项；豁免项会返回其命中的规则
+  下标 `rule_index`（`exemptions` 数组从 **0** 开始）；
+- 任一被检查方向存在**未豁免 error**，或**未豁免 warning 数超过该方向
+  `max_warnings` 上限**，门禁即失败（`pass: false`）；
+- 超限 warning 按报告顺序（direction → path → code）计数，排在额度之外的
+  成为阻断项；
+- `directions` 未包含的方向即使存在 error / warning 也**不影响结论**。
+
+```bash
+curl -X POST http://localhost:8000/api/analyses/1/gate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "directions": ["backward"],
+    "max_warnings": {"backward": 1},
+    "exemptions": [
+      {"direction": "backward", "code": "required_added", "path": "#"},
+      {"direction": "backward", "code": "pattern_changed",
+       "path": "#/properties/*"}
+    ]
+  }'
+```
+
+响应：
+
+```json
+{
+  "pass": true,
+  "counts": {
+    "backward": {
+      "errors": 0,
+      "warnings": 0,
+      "exempted": 3,
+      "total": 3,
+      "max_warnings": 1
+    }
+  },
+  "blocking": [],
+  "exempted": [
+    {
+      "direction": "backward",
+      "path": "#",
+      "code": "required_added",
+      "severity": "error",
+      "message": "字段 'b' 在新版中变为必填",
+      "reason": "旧版中 'b' 可以缺省……",
+      "counterexample": {},
+      "counterexample_path": "#",
+      "rule_index": 0
+    },
+    {
+      "direction": "backward",
+      "path": "#/properties/a",
+      "code": "pattern_changed",
+      "severity": "warning",
+      "message": "新版正则约束为 '^xx'",
+      "reason": "旧版 pattern 为 '^x'……",
+      "counterexample": null,
+      "counterexample_path": null,
+      "rule_index": 1
+    }
+  ]
+}
+```
+
+失败时 `blocking` 中每条阻断项在 issue 原有字段之外附带 `blocked_reason`：
+
+| `blocked_reason`            | 含义                       |
+| --------------------------- | -------------------------- |
+| `error`                     | 未豁免的 error             |
+| `warning_limit_exceeded`    | 未豁免 warning 数超出上限   |
+
+请求体不合法（如 `directions` 为空、规则 `path` 不是合法 JSON Pointer、
+上限为负数）返回 `422`。
 
 ### `GET /health`
 
